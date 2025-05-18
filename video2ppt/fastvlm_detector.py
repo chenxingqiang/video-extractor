@@ -140,7 +140,7 @@ class FastVLMDetector:
             logger.info(f"Model loaded on {self.device} in {load_time:.2f} seconds")
             
             # Warm up the model with a dummy inference
-            self._warmup()
+            self._warm_up()
             
         except Exception as e:
             logger.error(f"Failed to load FastVLM model: {e}")
