@@ -4,7 +4,7 @@
 __version__ = '0.3.0'
 
 from .compare import compareImg
-from .images2pdf import images2pdf
+from .images2pdf import images_to_pdf, images2pdf
 from .video2ppt import main as video2ppt
 from .window2ppt import main as window2ppt
 from .smart_window2ppt import main as smart_window2ppt
@@ -14,6 +14,7 @@ __all__ = [
     'window2ppt', 
     'smart_window2ppt',
     'compareImg', 
-    'images2pdf', 
+    'images_to_pdf',
+    'images2pdf',  # For backward compatibility
     '__version__'
 ]

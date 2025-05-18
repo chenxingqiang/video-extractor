@@ -44,23 +44,35 @@ class FastVLMDetector:
         'file manager', 'terminal', 'console', 'code', 'editor', 'ide'
     ]
     
-    def __init__(self, model_path: str, device: Optional[str] = None):
-        """Initialize the FastVLM detector.
+    def __init__(self, model_path: str, device: Optional[str] = None, debug: bool = False):
+        """Initialize the detector.
         
         Args:
-            model_path: Path to the FastVLM model directory
+            model_path: Path to the model directory
             device: Device to run the model on ('cuda', 'mps', or 'cpu')
+            debug: Enable debug mode for more verbose logging
         """
         self.model_path = model_path
         self.device = device or self._get_available_device()
+        self.debug = debug
+        
+        # Initialize model components
         self.model = None
         self.tokenizer = None
         self.image_processor = None
+        self.processor = None  # For BLIP model
+        self.model_type = None  # Will be set to 'fastvlm' or 'blip'
+        
+        # Performance tracking
         self.last_inference_time = 0
         self.total_inferences = 0
         
         # Load model and processor
         self._load_model()
+        
+        # Warm up the model with a dummy inference
+        if self.model is not None:
+            self._warm_up()
     
     def _get_available_device(self) -> str:
         """Get the best available device for inference."""
@@ -71,33 +83,58 @@ class FastVLMDetector:
         return 'cpu'
     
     def _load_model(self):
-        """Load the FastVLM model and processor."""
+        """Load the model for image analysis.
+        
+        This method attempts to load the FastVLM model if available, but falls back
+        to using a standard vision model if FastVLM is not compatible.
+        """
         try:
-            logger.info(f"Loading FastVLM model from {self.model_path}...")
+            logger.info(f"Loading model from {self.model_path}...")
             start_time = time.time()
             
-            # Load model with appropriate settings
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                torch_dtype=torch.float16 if 'cuda' in self.device else torch.float32,
-                low_cpu_mem_usage=True,
-                device_map="auto",
-                trust_remote_code=True
-            )
-            
-            # Load tokenizer and image processor separately for better compatibility
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_path,
-                trust_remote_code=True
-            )
-            
-            self.image_processor = AutoImageProcessor.from_pretrained(
-                self.model_path,
-                trust_remote_code=True
-            )
-            
-            # Set model to eval mode
-            self.model.eval()
+            # First try to load with trust_remote_code=True for FastVLM
+            try:
+                # Load model with appropriate settings
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_path,
+                    torch_dtype=torch.float16 if 'cuda' in self.device else torch.float32,
+                    low_cpu_mem_usage=True,
+                    device_map="auto",
+                    trust_remote_code=True
+                )
+                
+                # Load tokenizer and image processor separately for better compatibility
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_path,
+                    trust_remote_code=True
+                )
+                
+                self.image_processor = AutoImageProcessor.from_pretrained(
+                    self.model_path,
+                    trust_remote_code=True
+                )
+                
+                # Set model to eval mode
+                self.model.eval()
+                
+                logger.info(f"Successfully loaded FastVLM model in {time.time() - start_time:.2f}s")
+                self.model_type = "fastvlm"
+                
+            except (ValueError, KeyError) as e:
+                logger.warning(f"Failed to load FastVLM model: {e}. Falling back to standard vision model.")
+                
+                # Fall back to a standard vision-language model
+                from transformers import BlipProcessor, BlipForConditionalGeneration
+                
+                self.model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+                self.processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+                
+                # Move model to appropriate device
+                self.model = self.model.to(self.device)
+                self.model.eval()
+                
+                logger.info(f"Successfully loaded BLIP model in {time.time() - start_time:.2f}s")
+                self.model_type = "blip"
             
             load_time = time.time() - start_time
             logger.info(f"Model loaded on {self.device} in {load_time:.2f} seconds")
@@ -109,59 +146,47 @@ class FastVLMDetector:
             logger.error(f"Failed to load FastVLM model: {e}")
             raise
     
-    def _warmup(self):
-        """Warm up the model with a dummy inference."""
+    def _warm_up(self):
+        """Warm up the model with a dummy inference to ensure it's ready for real-time use."""
         try:
             logger.info("Warming up model with dummy inference...")
+            # Create a dummy image for inference
             dummy_image = np.zeros((224, 224, 3), dtype=np.uint8)
-            dummy_prompt = "Describe this image."
-            self._generate_description(dummy_image, dummy_prompt)
-            logger.info("Model warmup completed")
+            # Run a quick inference (result is discarded)
+            _, _, _ = self.is_ppt_content(dummy_image, confidence_threshold=0.5)
+            logger.info("Model warm-up completed successfully")
         except Exception as e:
-            logger.warning(f"Model warmup failed: {e}")
+            logger.warning(f"Model warm-up failed: {e}")
+            if self.debug:
+                import traceback
+                logger.warning(traceback.format_exc())
     
     def _generate_description(self, image: np.ndarray, prompt: str) -> str:
-        """Generate a description for the given image using the model."""
+        """Generate a description for an image using the model.
+        
+        Args:
+            image: Input image as a numpy array (BGR format)
+            prompt: Text prompt to guide the image description
+            
+        Returns:
+            Generated description text
+        """
         try:
-            # Convert BGR to RGB if needed
-            if len(image.shape) == 3 and image.shape[2] == 3:
-                image = image[..., ::-1]  # BGR to RGB
+            # Convert BGR to RGB and to PIL Image
+            image_rgb = image[..., ::-1]  # BGR to RGB
+            pil_image = Image.fromarray(image_rgb)
             
-            # Convert to PIL Image
-            pil_image = Image.fromarray(image)
+            # Process the image based on model type
+            start_time = time.time()
             
-            # Process the image and text
-            inputs = self.image_processor(
-                images=pil_image,
-                return_tensors="pt"
-            ).to(self.device)
-            
-            # Process text
-            text_inputs = self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_token_type_ids=False
-            ).to(self.device)
-            
-            # Generate description
-            with torch.no_grad():
-                start_time = time.time()
-                outputs = self.model.generate(
-                    input_ids=text_inputs.input_ids,
-                    pixel_values=inputs.pixel_values,
-                    max_new_tokens=150,
-                    do_sample=True,
-                    temperature=0.7,
-                    top_p=0.9,
-                    num_return_sequences=1
-                )
+            if hasattr(self, 'model_type') and self.model_type == 'blip':
+                # Using BLIP model
+                inputs = self.processor(pil_image, prompt, return_tensors="pt").to(self.device)
                 
-                # Update timing stats
-                inference_time = time.time() - start_time
-                self.last_inference_time = inference_time
+                with torch.no_grad():
+                    outputs = self.model.generate(**inputs, max_new_tokens=100)
+                    
+                description = self.processor.decode(outputs[0], skip_special_tokens=True)
                 self.total_inferences += 1
                 
                 # Decode the output
@@ -191,7 +216,7 @@ class FastVLMDetector:
         Returns:
             Tuple of (is_ppt, confidence, description)
         """
-        if self.model is None or self.processor is None:
+        if self.model is None:
             raise RuntimeError("Model not loaded. Call _load_model() first.")
         
         try:
@@ -199,36 +224,81 @@ class FastVLMDetector:
             image_rgb = image[..., ::-1]  # BGR to RGB
             pil_image = Image.fromarray(image_rgb)
             
-            # Process the image and generate description
-            prompt = "Describe this image in detail, focusing on whether it contains presentation slides or similar content."
-            inputs = self.processor(images=pil_image, text=prompt, return_tensors="pt").to(self.device)
-            
-            # Generate description
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=100,
-                    do_sample=True,
-                    temperature=0.7,
-                    top_p=0.9,
-                )
-            
-            # Decode the output
-            description = self.processor.batch_decode(outputs, skip_special_tokens=True)[0]
+            # Generate description based on model type
+            if hasattr(self, 'model_type') and self.model_type == 'blip':
+                # Using BLIP model
+                prompt = "Is this a presentation slide or PowerPoint? Describe in detail."
+                inputs = self.processor(pil_image, prompt, return_tensors="pt").to(self.device)
+                
+                with torch.no_grad():
+                    outputs = self.model.generate(**inputs, max_new_tokens=100)
+                    
+                description = self.processor.decode(outputs[0], skip_special_tokens=True)
+                
+            else:
+                # Using FastVLM model
+                prompt = "Describe this image in detail, focusing on whether it contains presentation slides or similar content."
+                
+                # Process the image based on available processors
+                if hasattr(self, 'processor') and self.processor is not None:
+                    inputs = self.processor(images=pil_image, text=prompt, return_tensors="pt").to(self.device)
+                elif hasattr(self, 'tokenizer') and hasattr(self, 'image_processor'):
+                    # Separate tokenizer and image processor
+                    pixel_values = self.image_processor(images=pil_image, return_tensors="pt").pixel_values.to(self.device)
+                    input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+                    inputs = {"pixel_values": pixel_values, "input_ids": input_ids}
+                else:
+                    raise RuntimeError("No valid processor found for the model")
+                
+                # Generate description
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=100,
+                        do_sample=True,
+                        temperature=0.7,
+                        top_p=0.9,
+                    )
+                
+                # Decode the output
+                if hasattr(self, 'processor') and self.processor is not None:
+                    description = self.processor.batch_decode(outputs, skip_special_tokens=True)[0]
+                else:
+                    description = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             
             # Check for PPT-related keywords
             description_lower = description.lower()
             keyword_matches = sum(keyword in description_lower for keyword in self.PPT_KEYWORDS)
             
-            # Calculate confidence score (simple heuristic based on keyword matches)
-            confidence = min(1.0, keyword_matches / 3.0)  # Cap at 1.0
+            # Check for negative keywords
+            negative_matches = sum(keyword in description_lower for keyword in self.NEGATIVE_KEYWORDS)
+            
+            # Calculate confidence score with penalty for negative keywords
+            confidence = min(1.0, (keyword_matches - (negative_matches * 0.5)) / 3.0)  # Cap at 1.0
+            confidence = max(0.0, confidence)  # Ensure non-negative
+            
+            # Additional heuristics for PPT detection
+            if 'slide' in description_lower and 'presentation' in description_lower:
+                confidence += 0.2
+            if 'bullet point' in description_lower or 'bullet points' in description_lower:
+                confidence += 0.1
+            if 'title' in description_lower and 'subtitle' in description_lower:
+                confidence += 0.1
+                
+            confidence = min(1.0, confidence)  # Cap at 1.0 again after adjustments
             is_ppt = confidence >= confidence_threshold
+            
+            # Log the detection result
+            logger.debug(f"PPT detection: confidence={confidence:.2f}, is_ppt={is_ppt}")
             
             return is_ppt, confidence, description
             
         except Exception as e:
             logger.error(f"Error during PPT detection: {e}")
-            return False, 0.0, str(e)
+            if self.debug:
+                import traceback
+                logger.error(traceback.format_exc())
+            return False, 0.0, f"Error: {str(e)}"
     
     def process_frame(self, frame: np.ndarray, confidence_threshold: float = 0.3) -> Dict[str, Any]:
         """Process a single frame and return detection results.
